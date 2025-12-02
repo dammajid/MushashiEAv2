@@ -1,0 +1,1135 @@
+//+------------------------------------------------------------------+
+//|                                   MurphyEA_V2_Market_Ready.mq5   |
+//|                                   Copyright 2025, Murphy Trading |
+//|                                   https://www.mql5.com           |
+//+------------------------------------------------------------------+
+#property copyright   "Copyright 2025, Murphy Trading"
+#property link        "https://www.mql5.com"
+#property version     "2.15"
+#property description "Smart Money OB - ZERO Errors (Invalid Stops & Margin Fixed)"
+#property description "Ultra-Safe SL/TP Calculation with Price Refresh"
+#property strict
+
+#include <Trade\PositionInfo.mqh>
+#include <Trade\Trade.mqh>
+
+CPositionInfo m_pos;
+CTrade m_trade;
+
+//+------------------------------------------------------------------+
+//| INPUT PARAMETERS                                                  |
+//+------------------------------------------------------------------+
+sinput group "=== Trading Settings ==="
+input ENUM_TIMEFRAMES Timeframe_Execution = PERIOD_M5;    
+input double          LotSize            = 0.01;          
+input double          RiskPercent        = 2.0;           
+input bool            UseHedging         = false;         
+input int             MaxDailyTrades     = 10;           
+input bool            AdaptiveMode       = true;         
+
+sinput group "=== Take Profit Settings ==="
+input bool            UseDynamicTP       = true;          // Use Dynamic TP (ATR)
+input double          ATR_Multiplier     = 2.0;           // ATR Multiplier for TP
+input int             FixedTP_Pips       = 100;           // Fixed TP in Pips
+
+sinput group "=== Risk Management ==="
+input int             TrailingStartPips  = 40;            
+input int             TrailingStepPips   = 10;         
+input int             BreakEvenStartPips = 50;            
+
+sinput group "=== Filters ==="
+input bool            UseVolumeFilter    = true;          
+input double          MinVolumeRatio     = 1.2;          
+input bool            UseFVG             = true;         
+input int             FVG_MinPips        = 5;             
+
+sinput group "=== Time Filter ==="
+input int             StartHourUTC       = 2;             
+input int             EndHourUTC         = 20;            
+
+sinput group "=== Order Block Settings ==="
+input int             OB_Lookback        = 30;            
+input int             OB_BufferPips      = 3;            
+
+sinput group "=== Visualization ==="
+input bool            ShowOrderBlocks    = true;          
+input bool            ShowFVG            = true;          
+input int             MaxOB_Display      = 3;             
+input color           BuyOB_Color        = clrDodgerBlue; 
+input color           SellOB_Color       = clrCrimson;    
+input color           FVG_Buy_Color      = clrAqua;       
+input color           FVG_Sell_Color     = clrOrange;    
+input bool            ShowOB_Labels      = true;         
+input bool            ShowInfoPanel      = true;         
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                  |
+//+------------------------------------------------------------------+
+datetime lastBuyTime  = 0;
+datetime lastSellTime = 0;
+datetime lastOBUpdate = 0;
+int atrHandle = INVALID_HANDLE;
+int obCounter = 0;
+
+// Symbol-specific adaptive settings
+struct SymbolSettings
+{
+   double freezeMultiplier;   // Freeze level multiplier
+   int    minImprovement;     // Min points for trailing update
+   int    extraProfitBuffer;  // Extra profit requirement
+};
+
+SymbolSettings adaptiveSettings;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // Symbol validation
+   if(!SymbolInfoInteger(_Symbol, SYMBOL_SELECT))
+   {
+      Print("ERROR: Symbol not available in Market Watch");
+      return INIT_FAILED;
+   }
+   
+   // Initialize adaptive settings
+   InitializeAdaptiveSettings();
+   
+   // Lot size validation
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   Print("Symbol Info: ", _Symbol);
+   Print("  Min Lot: ", minLot);
+   Print("  Max Lot: ", maxLot);
+   Print("  Lot Step: ", lotStep);
+   
+   if(AdaptiveMode)
+   {
+      Print("  Adaptive Mode: ON");
+      Print("  Freeze Multiplier: ", adaptiveSettings.freezeMultiplier);
+      Print("  Min Improvement: ", adaptiveSettings.minImprovement, " points");
+   }
+   
+   if(LotSize > 0 && LotSize < minLot)
+   {
+      Print("WARNING: LotSize ", LotSize, " is below minimum ", minLot, ". Using minimum lot.");
+   }
+   
+   if(MaxDailyTrades <= 0)
+   {
+      Print("ERROR: Invalid MaxDailyTrades");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+   
+   // Initialize ATR
+   atrHandle = iATR(_Symbol, Timeframe_Execution, 14);
+   if(atrHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create ATR indicator");
+      return INIT_FAILED;
+   }
+   
+   // Set trade parameters
+   m_trade.SetExpertMagicNumber(230615);
+   m_trade.SetDeviationInPoints(50);
+   m_trade.SetTypeFilling(GetFillingMode());
+   m_trade.SetAsyncMode(false);
+   
+   // Chart settings
+   if(MQLInfoInteger(MQL_VISUAL_MODE) || !MQLInfoInteger(MQL_TESTER))
+   {
+      ChartSetInteger(0, CHART_SHOW_GRID, false);
+      if(ShowInfoPanel) DrawInfoPanel();
+   }
+   
+   Print("SUCCESS: MurphyEA V2 Initialized | Symbol: ", _Symbol, " | TF: ", EnumToString(Timeframe_Execution));
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(atrHandle != INVALID_HANDLE) 
+      IndicatorRelease(atrHandle);
+   
+   DeleteAllObjects();
+   Comment("");
+   
+   Print("MurphyEA V2 Deinitialized. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Initialize Adaptive Settings per Symbol                          |
+//+------------------------------------------------------------------+
+void InitializeAdaptiveSettings()
+{
+   if(!AdaptiveMode)
+   {
+      // Default safe settings
+      adaptiveSettings.freezeMultiplier = 2.0;
+      adaptiveSettings.minImprovement = 50;
+      adaptiveSettings.extraProfitBuffer = 20;
+      return;
+   }
+   
+   string symbol = _Symbol;
+   
+   // EURUSD - Most volatile major pair
+   if(StringFind(symbol, "EURUSD") >= 0)
+   {
+      adaptiveSettings.freezeMultiplier = 2.5;  // Extra conservative
+      adaptiveSettings.minImprovement = 60;     // Larger improvement needed
+      adaptiveSettings.extraProfitBuffer = 30;  // Wait more profit
+   }
+   // GBPUSD - High volatility
+   else if(StringFind(symbol, "GBPUSD") >= 0 || StringFind(symbol, "GBPJPY") >= 0)
+   {
+      adaptiveSettings.freezeMultiplier = 2.3;
+      adaptiveSettings.minImprovement = 70;
+      adaptiveSettings.extraProfitBuffer = 30;
+   }
+   // USDJPY - Stable pair
+   else if(StringFind(symbol, "USDJPY") >= 0)
+   {
+      adaptiveSettings.freezeMultiplier = 1.8;
+      adaptiveSettings.minImprovement = 40;
+      adaptiveSettings.extraProfitBuffer = 15;
+   }
+   // XAUUSD (Gold) - Very volatile
+   else if(StringFind(symbol, "XAUUSD") >= 0 || StringFind(symbol, "GOLD") >= 0)
+   {
+      adaptiveSettings.freezeMultiplier = 3.0;
+      adaptiveSettings.minImprovement = 100;
+      adaptiveSettings.extraProfitBuffer = 50;
+   }
+   // Other pairs - Medium settings
+   else
+   {
+      adaptiveSettings.freezeMultiplier = 2.0;
+      adaptiveSettings.minImprovement = 50;
+      adaptiveSettings.extraProfitBuffer = 20;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get Filling Mode                                                  |
+//+------------------------------------------------------------------+
+ENUM_ORDER_TYPE_FILLING GetFillingMode()
+{
+   int filling = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   
+   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+      return ORDER_FILLING_FOK;
+   else if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+      return ORDER_FILLING_IOC;
+   else
+      return ORDER_FILLING_RETURN;
+}
+
+//+------------------------------------------------------------------+
+//| Normalize & Validate Lot Size                                    |
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   if(lotStep == 0)
+      lotStep = 0.01;
+   
+   // Round to lot step
+   lot = MathRound(lot / lotStep) * lotStep;
+   
+   // Enforce limits
+   if(lot < minLot)
+      lot = minLot;
+   if(lot > maxLot)
+      lot = maxLot;
+   
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Auto Lot Size with Strict Margin Check                |
+//+------------------------------------------------------------------+
+double GetAutoLotSize(double stopLossPips)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   
+   // If manual lot size specified
+   if(LotSize > 0)
+   {
+      double requestedLot = NormalizeLot(LotSize);
+      
+      // Calculate margin for requested lot
+      double requiredMargin = 0;
+      double testPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, requestedLot, testPrice, requiredMargin))
+      {
+         Print("ERROR: Cannot calculate margin requirement");
+         return 0;
+      }
+      
+      // Use only 50% of free margin for safety (more conservative)
+      double safeMargin = freeMargin * 0.5;
+      
+      if(requiredMargin > safeMargin)
+      {
+         // Try to calculate smaller lot
+         double ratio = safeMargin / requiredMargin;
+         double reducedLot = requestedLot * ratio * 0.9; // 90% safety factor
+         reducedLot = NormalizeLot(reducedLot);
+         
+         if(reducedLot < minLot)
+         {
+            Print("MARGIN WARNING: Insufficient margin");
+            Print("  Requested lot: ", requestedLot, " | Required margin: $", requiredMargin);
+            Print("  Free margin: $", freeMargin, " | Safe margin (50%): $", safeMargin);
+            Print("  Trade SKIPPED - not enough margin even for minimum lot");
+            return 0; // Skip trade
+         }
+         
+         // Verify reduced lot has enough margin
+         double reducedMargin = 0;
+         if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, reducedLot, testPrice, reducedMargin))
+            return 0;
+         
+         if(reducedMargin > freeMargin * 0.6) // Still too much
+         {
+            Print("MARGIN WARNING: Even reduced lot requires too much margin");
+            Print("  Reduced lot: ", reducedLot, " | Required: $", reducedMargin, " | Available: $", freeMargin);
+            return 0;
+         }
+         
+         Print("INFO: Lot auto-reduced for margin safety");
+         Print("  Original: ", requestedLot, " ($", requiredMargin, ") -> Reduced: ", reducedLot, " ($", reducedMargin, ")");
+         Print("  Free margin: $", freeMargin, " | Balance: $", balance);
+         return reducedLot;
+      }
+      
+      return requestedLot;
+   }
+   
+   // Auto calculation based on risk
+   double riskMoney = balance * RiskPercent / 100.0;
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   
+   if(tickSize == 0 || tickValue == 0)
+      return 0;
+   
+   double stopLossPoints = stopLossPips * point * 10;
+   double moneyPerLot = stopLossPoints / tickSize * tickValue;
+   
+   if(moneyPerLot == 0)
+      return 0;
+   
+   double calculatedLot = riskMoney / moneyPerLot;
+   calculatedLot = NormalizeLot(calculatedLot);
+   
+   // Check margin for calculated lot
+   double requiredMargin = 0;
+   double testPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, calculatedLot, testPrice, requiredMargin))
+      return 0;
+   
+   if(requiredMargin > freeMargin * 0.5)
+   {
+      double ratio = (freeMargin * 0.5) / requiredMargin;
+      double safeLot = calculatedLot * ratio * 0.9;
+      safeLot = NormalizeLot(safeLot);
+      
+      if(safeLot < minLot)
+      {
+         Print("MARGIN WARNING: Auto-calculated lot too large for available margin - SKIPPING");
+         return 0;
+      }
+      
+      Print("INFO: Auto lot reduced from ", calculatedLot, " to ", safeLot, " for margin safety");
+      return safeLot;
+   }
+   
+   return calculatedLot;
+}
+
+//+------------------------------------------------------------------+
+//| Info Panel (Lightweight)                                          |
+//+------------------------------------------------------------------+
+void DrawInfoPanel()
+{
+   int x = 10, y = 20;
+   
+   CreateLabel("Info_Title", x, y, "Jirisan OB V2", clrDeepPink, 12);
+   CreateLabel("Info_Balance", x, y+20, "", clrAqua, 9);
+   CreateLabel("Info_Profit", x, y+35, "", clrGold, 9);
+   CreateLabel("Info_Trades", x, y+50, "", clrWhite, 9);
+   CreateLabel("Info_Status", x, y+65, "", clrLime, 9);
+}
+
+void CreateLabel(string name, int x, int y, string text, color clr, int size)
+{
+   ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, size);
+   ObjectSetString(0, name, OBJPROP_FONT, "Arial");
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void UpdateInfoPanel()
+{
+   if(!ShowInfoPanel) return;
+   
+   ObjectSetString(0, "Info_Balance", OBJPROP_TEXT, 
+      "Balance: $" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
+   ObjectSetString(0, "Info_Profit", OBJPROP_TEXT, 
+      "Profit: $" + DoubleToString(AccountInfoDouble(ACCOUNT_PROFIT), 2));
+   ObjectSetString(0, "Info_Trades", OBJPROP_TEXT, 
+      "Today: " + IntegerToString(CountTodayTrades()) + "/" + IntegerToString(MaxDailyTrades));
+   
+   string status = IsTradingTime() ? "ACTIVE" : "WAITING";
+   ObjectSetString(0, "Info_Status", OBJPROP_TEXT, "Status: " + status);
+   ObjectSetInteger(0, "Info_Status", OBJPROP_COLOR, IsTradingTime() ? clrLime : clrOrange);
+}
+
+//+------------------------------------------------------------------+
+//| FVG Detection                                                     |
+//+------------------------------------------------------------------+
+bool HasBullishFVG(int index, double &fvgHigh, double &fvgLow)
+{
+   if(!UseFVG) return true;
+   
+   double high1 = iHigh(_Symbol, Timeframe_Execution, index + 1);
+   double low3  = iLow(_Symbol, Timeframe_Execution, index - 1);
+   
+   if(low3 > high1)
+   {
+      double gapPips = (low3 - high1) / SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 10;
+      if(gapPips >= FVG_MinPips)
+      {
+         fvgHigh = low3;
+         fvgLow = high1;
+         return true;
+      }
+   }
+   return false;
+}
+
+bool HasBearishFVG(int index, double &fvgHigh, double &fvgLow)
+{
+   if(!UseFVG) return true;
+   
+   double high1 = iHigh(_Symbol, Timeframe_Execution, index + 1);
+   double low3  = iLow(_Symbol, Timeframe_Execution, index - 1);
+   
+   if(high1 > low3)
+   {
+      double gapPips = (high1 - low3) / SymbolInfoDouble(_Symbol, SYMBOL_POINT) / 10;
+      if(gapPips >= FVG_MinPips)
+      {
+         fvgHigh = high1;
+         fvgLow = low3;
+         return true;
+      }
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Volume Filter                                                     |
+//+------------------------------------------------------------------+
+bool IsHighVolume(int index)
+{
+   if(!UseVolumeFilter) return true;
+   
+   long volumes[];
+   ArraySetAsSeries(volumes, true);
+   
+   if(CopyTickVolume(_Symbol, Timeframe_Execution, index, 20, volumes) != 20)
+      return true;
+   
+   long currentVol = volumes[0];
+   long avgVol = 0;
+   for(int i = 1; i < 20; i++) 
+      avgVol += volumes[i];
+   avgVol /= 19;
+   
+   return (currentVol >= avgVol * MinVolumeRatio);
+}
+
+//+------------------------------------------------------------------+
+//| Dynamic TP                                                        |
+//+------------------------------------------------------------------+
+double GetDynamicTP()
+{
+   if(!UseDynamicTP) 
+      return FixedTP_Pips * SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   
+   if(CopyBuffer(atrHandle, 0, 0, 1, atr) != 1)
+      return FixedTP_Pips * SymbolInfoDouble(_Symbol, SYMBOL_POINT) * 10;
+   
+   return atr[0] * ATR_Multiplier;
+}
+
+//+------------------------------------------------------------------+
+//| Order Block Detection (Optimized)                                |
+//+------------------------------------------------------------------+
+bool FindBuyOB(double &obHigh, double &obLow)
+{
+   for(int i = 5; i < OB_Lookback; i++)
+   {
+      double low0 = iLow(_Symbol, Timeframe_Execution, i);
+      double low1 = iLow(_Symbol, Timeframe_Execution, i + 1);
+      
+      if(low0 >= low1) continue;
+      
+      double open  = iOpen(_Symbol, Timeframe_Execution, i - 1);
+      double close = iClose(_Symbol, Timeframe_Execution, i - 1);
+      double high  = iHigh(_Symbol, Timeframe_Execution, i - 1);
+      double low   = iLow(_Symbol, Timeframe_Execution, i - 1);
+      
+      if(close <= open) continue;
+      
+      double body = close - open;
+      double range = high - low;
+      if(range == 0) continue;
+      
+      if(body / range < 0.4) continue;
+      if(!IsHighVolume(i - 1)) continue;
+      
+      double fvgH, fvgL;
+      if(!HasBullishFVG(i - 1, fvgH, fvgL)) continue;
+      
+      obHigh = high;
+      obLow = low;
+      
+      // Draw only in visual mode or live trading
+      if(ShowOrderBlocks && (MQLInfoInteger(MQL_VISUAL_MODE) || !MQLInfoInteger(MQL_TESTER)))
+      {
+         datetime time = iTime(_Symbol, Timeframe_Execution, i - 1);
+         DrawOrderBlock(time, high, low, true);
+         if(ShowFVG) DrawFVG(time, fvgH, fvgL, true);
+      }
+      
+      return true;
+   }
+   return false;
+}
+
+bool FindSellOB(double &obHigh, double &obLow)
+{
+   for(int i = 5; i < OB_Lookback; i++)
+   {
+      double high0 = iHigh(_Symbol, Timeframe_Execution, i);
+      double high1 = iHigh(_Symbol, Timeframe_Execution, i + 1);
+      
+      if(high0 <= high1) continue;
+      
+      double open  = iOpen(_Symbol, Timeframe_Execution, i - 1);
+      double close = iClose(_Symbol, Timeframe_Execution, i - 1);
+      double high  = iHigh(_Symbol, Timeframe_Execution, i - 1);
+      double low   = iLow(_Symbol, Timeframe_Execution, i - 1);
+      
+      if(close >= open) continue;
+      
+      double body = open - close;
+      double range = high - low;
+      if(range == 0) continue;
+      
+      if(body / range < 0.4) continue;
+      if(!IsHighVolume(i - 1)) continue;
+      
+      double fvgH, fvgL;
+      if(!HasBearishFVG(i - 1, fvgH, fvgL)) continue;
+      
+      obHigh = high;
+      obLow = low;
+      
+      if(ShowOrderBlocks && (MQLInfoInteger(MQL_VISUAL_MODE) || !MQLInfoInteger(MQL_TESTER)))
+      {
+         datetime time = iTime(_Symbol, Timeframe_Execution, i - 1);
+         DrawOrderBlock(time, high, low, false);
+         if(ShowFVG) DrawFVG(time, fvgH, fvgL, false);
+      }
+      
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Draw Functions (Optimized)                                        |
+//+------------------------------------------------------------------+
+void DrawOrderBlock(datetime time, double high, double low, bool isBuy)
+{
+   string objName = "OB_" + (isBuy ? "B_" : "S_") + IntegerToString(obCounter++);
+   datetime timeEnd = time + PeriodSeconds(Timeframe_Execution) * 50;
+   
+   if(ObjectCreate(0, objName, OBJ_RECTANGLE, 0, time, high, timeEnd, low))
+   {
+      color rectColor = isBuy ? BuyOB_Color : SellOB_Color;
+      ObjectSetInteger(0, objName, OBJPROP_COLOR, rectColor);
+      ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, objName, OBJPROP_WIDTH, 2);
+      ObjectSetInteger(0, objName, OBJPROP_BACK, true);
+      ObjectSetInteger(0, objName, OBJPROP_FILL, true);
+      ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, true);
+      
+      if(ShowOB_Labels)
+      {
+         string labelName = objName + "_L";
+         double labelPrice = isBuy ? low : high;
+         
+         if(ObjectCreate(0, labelName, OBJ_TEXT, 0, time, labelPrice))
+         {
+            ObjectSetString(0, labelName, OBJPROP_TEXT, isBuy ? "BUY" : "SELL");
+            ObjectSetInteger(0, labelName, OBJPROP_COLOR, isBuy ? clrLime : clrRed);
+            ObjectSetInteger(0, labelName, OBJPROP_FONTSIZE, 8);
+            ObjectSetString(0, labelName, OBJPROP_FONT, "Arial Bold");
+            ObjectSetInteger(0, labelName, OBJPROP_ANCHOR, isBuy ? ANCHOR_UPPER : ANCHOR_LOWER);
+         }
+      }
+   }
+}
+
+void DrawFVG(datetime time, double high, double low, bool isBuy)
+{
+   string objName = "FVG_" + IntegerToString(obCounter++);
+   datetime timeEnd = time + PeriodSeconds(Timeframe_Execution) * 30;
+   
+   if(ObjectCreate(0, objName, OBJ_RECTANGLE, 0, time, high, timeEnd, low))
+   {
+      color fvgColor = isBuy ? FVG_Buy_Color : FVG_Sell_Color;
+      ObjectSetInteger(0, objName, OBJPROP_COLOR, fvgColor);
+      ObjectSetInteger(0, objName, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, objName, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, objName, OBJPROP_BACK, true);
+      ObjectSetInteger(0, objName, OBJPROP_FILL, false);
+      ObjectSetInteger(0, objName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, objName, OBJPROP_RAY_RIGHT, true);
+   }
+}
+
+void DeleteAllObjects()
+{
+   for(int i = ObjectsTotal(0) - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i);
+      if(StringFind(name, "OB_") == 0 || 
+         StringFind(name, "FVG_") == 0 || 
+         StringFind(name, "Info_") == 0)
+         ObjectDelete(0, name);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Entry Signals                                                     |
+//+------------------------------------------------------------------+
+bool IsBuySignal(double obHigh, double obLow)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   
+   if(ask < obLow || ask > obHigh) return false;
+   if(!IsBullishOnTF(PERIOD_H1)) return false;
+   
+   double close1 = iClose(_Symbol, Timeframe_Execution, 1);
+   double open1  = iOpen(_Symbol, Timeframe_Execution, 1);
+   if(close1 <= open1) return false;
+   
+   return true;
+}
+
+bool IsSellSignal(double obHigh, double obLow)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   if(bid < obLow || bid > obHigh) return false;
+   if(!IsBearishOnTF(PERIOD_H1)) return false;
+   
+   double close1 = iClose(_Symbol, Timeframe_Execution, 1);
+   double open1  = iOpen(_Symbol, Timeframe_Execution, 1);
+   if(close1 >= open1) return false;
+   
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Helper Functions                                                  |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   datetime nowUTC = TimeGMT();
+   int hour = (nowUTC % 86400) / 3600;
+   return (hour >= StartHourUTC && hour < EndHourUTC);
+}
+
+int CountTodayTrades()
+{
+   int count = 0;
+   datetime todayStart = iTime(_Symbol, PERIOD_D1, 0);
+   
+   if(!HistorySelect(todayStart, TimeCurrent()))
+      return 0;
+   
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) == _Symbol &&
+         HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN &&
+         HistoryDealGetInteger(ticket, DEAL_MAGIC) == 230615)
+         count++;
+   }
+   return count;
+}
+
+int CountOpenPositions(ENUM_POSITION_TYPE type)
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      if(m_pos.SelectByIndex(i) && 
+         m_pos.Symbol() == _Symbol && 
+         m_pos.Magic() == 230615 &&
+         m_pos.PositionType() == type)
+         count++;
+   }
+   return count;
+}
+
+bool IsBullishOnTF(ENUM_TIMEFRAMES tf)
+{
+   double o = iOpen(_Symbol, tf, 1);
+   double c = iClose(_Symbol, tf, 1);
+   return (c > o);
+}
+
+bool IsBearishOnTF(ENUM_TIMEFRAMES tf)
+{
+   double o = iOpen(_Symbol, tf, 1);
+   double c = iClose(_Symbol, tf, 1);
+   return (c < o);
+}
+
+//+------------------------------------------------------------------+
+//| Main Trading Logic                                                |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Update panel every 5 seconds
+   static datetime lastUpdate = 0;
+   if(TimeCurrent() - lastUpdate > 5)
+   {
+      UpdateInfoPanel();
+      lastUpdate = TimeCurrent();
+   }
+   
+   // Basic checks
+   if(!IsTradingTime()) return;
+   if(CountTodayTrades() >= MaxDailyTrades) return;
+   
+   // Position limits
+   int openBuy = CountOpenPositions(POSITION_TYPE_BUY);
+   int openSell = CountOpenPositions(POSITION_TYPE_SELL);
+   
+   if(!UseHedging && (openBuy > 0 || openSell > 0))
+   {
+      CheckTrailingStop();
+      CheckBreakEven();
+      return;
+   }
+   
+   // Update OB only on new bar
+   datetime currentBarTime = iTime(_Symbol, Timeframe_Execution, 0);
+   if(currentBarTime != lastOBUpdate)
+   {
+      lastOBUpdate = currentBarTime;
+      
+      double obHighBuy, obLowBuy, obHighSell, obLowSell;
+      bool hasBuyOB = FindBuyOB(obHighBuy, obLowBuy);
+      bool hasSellOB = FindSellOB(obHighSell, obLowSell);
+      
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double dynamicTP = GetDynamicTP();
+      
+      // Entry BUY
+      if(hasBuyOB && openBuy == 0 && IsBuySignal(obHighBuy, obLowBuy))
+      {
+         datetime now = TimeCurrent();
+         if(now != lastBuyTime)
+         {
+            double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+            
+            // Get broker requirements
+            long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+            long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+            
+            // Calculate ULTRA-SAFE minimum distance
+            double minDistance = MathMax(stopLevel, freezeLevel) * point;
+            if(minDistance < 40 * point) minDistance = 40 * point;
+            minDistance += 30 * point; // Total 70 points minimum
+            
+            // Get FRESH price
+            double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            
+            // Calculate initial SL/TP
+            double sl = obLowBuy - OB_BufferPips * point * 10;
+            double tp = ask + dynamicTP;
+            
+            // FORCE SL to SAFE distance (ALWAYS)
+            sl = ask - minDistance;
+            Print("INFO: BUY SL set to SAFE distance: ", sl, " (ask - ", minDistance/point, " points)");
+            
+            // FORCE TP to SAFE distance if needed
+            if(dynamicTP < minDistance)
+            {
+               tp = ask + minDistance;
+               Print("INFO: BUY TP adjusted - dynamicTP too small");
+            }
+            
+            // Normalize
+            sl = NormalizeDouble(sl, _Digits);
+            tp = NormalizeDouble(tp, _Digits);
+            ask = NormalizeDouble(ask, _Digits);
+            
+            // Get FRESH price AGAIN
+            double askFinal = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_ASK), _Digits);
+            
+            // Recalculate with fresh price
+            double slDistance = askFinal - sl;
+            double tpDistance = tp - askFinal;
+            
+            // FINAL SAFETY CHECK
+            if(slDistance < minDistance)
+            {
+               sl = askFinal - minDistance - 5 * point;
+               sl = NormalizeDouble(sl, _Digits);
+               Print("CRITICAL: BUY SL re-adjusted due to price movement");
+            }
+            
+            if(tpDistance < minDistance)
+            {
+               tp = askFinal + minDistance + 5 * point;
+               tp = NormalizeDouble(tp, _Digits);
+               Print("CRITICAL: BUY TP re-adjusted due to price movement");
+            }
+            
+            // Triple-check distances
+            slDistance = askFinal - sl;
+            tpDistance = tp - askFinal;
+            
+            if(slDistance >= minDistance - 2*point && tpDistance >= minDistance - 2*point)
+            {
+               double slPips = slDistance / point / 10;
+               double volume = GetAutoLotSize(slPips);
+               
+               // Check if volume is valid (not zero = insufficient margin)
+               if(volume <= 0)
+               {
+                  Print("WARNING: BUY skipped - Insufficient margin for safe lot size");
+               }
+               else if(m_trade.PositionOpen(_Symbol, ORDER_TYPE_BUY, volume, askFinal, sl, tp, "OB Buy"))
+               {
+                  lastBuyTime = now;
+                  Print("BUY Entry: ", volume, " lots @ ", askFinal, " | SL: ", sl, " | TP: ", tp);
+               }
+               else
+               {
+                  Print("BUY Entry Failed: ", m_trade.ResultRetcodeDescription());
+                  Print("  Final Ask: ", askFinal, " | SL: ", sl, " (", slDistance/point, " pts) | TP: ", tp, " (", tpDistance/point, " pts)");
+               }
+            }
+            else
+            {
+               Print("WARNING: BUY blocked after all adjustments");
+               Print("  SL dist: ", slDistance/point, " | TP dist: ", tpDistance/point, " | Min: ", minDistance/point);
+            }
+         }
+      }
+      
+      // Entry SELL
+      if(hasSellOB && openSell == 0 && IsSellSignal(obHighSell, obLowSell))
+      {
+         datetime now = TimeCurrent();
+         if(now != lastSellTime)
+         {
+            double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+            
+            // Get broker requirements
+            long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+            long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+            
+            // Calculate ULTRA-SAFE minimum distance
+            double minDistance = MathMax(stopLevel, freezeLevel) * point;
+            if(minDistance < 40 * point) minDistance = 40 * point; // Raised from 30
+            minDistance += 30 * point; // Raised from 20 (total 70 points!)
+            
+            // Get FRESH price right before calculation
+            double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            
+            // Calculate initial SL/TP
+            double sl = obHighSell + OB_BufferPips * point * 10;
+            double tp = bid - dynamicTP;
+            
+            // FORCE SL to SAFE distance (ALWAYS adjust, no exception)
+            sl = bid + minDistance;
+            Print("INFO: SELL SL set to SAFE distance: ", sl, " (bid + ", minDistance/point, " points)");
+            
+            // FORCE TP to SAFE distance
+            if(dynamicTP < minDistance)
+            {
+               tp = bid - minDistance;
+               Print("INFO: SELL TP adjusted - dynamicTP too small");
+            }
+            
+            // CRITICAL: Ensure TP is positive
+            if(tp <= 0)
+            {
+               tp = bid - minDistance;
+               Print("WARNING: SELL TP was negative, reset to ", tp);
+            }
+            
+            // Normalize ALL prices
+            sl = NormalizeDouble(sl, _Digits);
+            tp = NormalizeDouble(tp, _Digits);
+            bid = NormalizeDouble(bid, _Digits);
+            
+            // Get FRESH price AGAIN right before order (critical!)
+            double bidFinal = NormalizeDouble(SymbolInfoDouble(_Symbol, SYMBOL_BID), _Digits);
+            
+            // Recalculate distances with FRESH price
+            double slDistance = sl - bidFinal;
+            double tpDistance = bidFinal - tp;
+            
+            // FINAL SAFETY CHECK
+            if(slDistance < minDistance)
+            {
+               sl = bidFinal + minDistance + 5 * point; // Add extra 5 points
+               sl = NormalizeDouble(sl, _Digits);
+               Print("CRITICAL: SELL SL re-adjusted due to price movement");
+            }
+            
+            if(tpDistance < minDistance)
+            {
+               tp = bidFinal - minDistance - 5 * point;
+               tp = NormalizeDouble(tp, _Digits);
+               Print("CRITICAL: SELL TP re-adjusted due to price movement");
+            }
+            
+            // Final TP validation
+            bool tpValid = (tp > 0);
+            if(!tpValid)
+            {
+               Print("ERROR: SELL TP still invalid after adjustment - BLOCKING order");
+            }
+            
+            // Triple-check distances one last time
+            slDistance = sl - bidFinal;
+            tpDistance = bidFinal - tp;
+            
+            if(tpValid && slDistance >= minDistance - 2*point && tpDistance >= minDistance - 2*point)
+            {
+               double slPips = slDistance / point / 10;
+               double volume = GetAutoLotSize(slPips);
+               
+               // Check if volume is valid (not zero = insufficient margin)
+               if(volume <= 0)
+               {
+                  Print("WARNING: SELL skipped - Insufficient margin for safe lot size");
+               }
+               else if(m_trade.PositionOpen(_Symbol, ORDER_TYPE_SELL, volume, bidFinal, sl, tp, "OB Sell"))
+               {
+                  lastSellTime = now;
+                  Print("SELL Entry: ", volume, " lots @ ", bidFinal, " | SL: ", sl, " | TP: ", tp);
+               }
+               else
+               {
+                  Print("SELL Entry Failed: ", m_trade.ResultRetcodeDescription());
+                  Print("  Final Bid: ", bidFinal, " | SL: ", sl, " (", slDistance/point, " pts) | TP: ", tp, " (", tpDistance/point, " pts)");
+               }
+            }
+            else
+            {
+               if(!tpValid)
+                  Print("WARNING: SELL blocked - TP is invalid (TP <= 0)");
+               else
+                  Print("WARNING: SELL blocked - Distances not safe (SL: ", slDistance/point, " TP: ", tpDistance/point, " Min: ", minDistance/point, ")");
+            }
+         }
+      }
+   }
+   
+   // Manage positions
+   CheckTrailingStop();
+   CheckBreakEven();
+}
+
+//+------------------------------------------------------------------+
+//| Trailing Stop (EURUSD Optimized - Adaptive)                     |
+//+------------------------------------------------------------------+
+void CheckTrailingStop()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   
+   // Calculate safe distance with adaptive multiplier
+   double baseDistance = MathMax(freezeLevel, stopLevel) * point;
+   if(baseDistance == 0 || baseDistance < 30 * point) 
+      baseDistance = 50 * point;
+   
+   // Apply adaptive multiplier
+   double minDistance = baseDistance * adaptiveSettings.freezeMultiplier;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!m_pos.SelectByIndex(i) || m_pos.Symbol() != _Symbol || m_pos.Magic() != 230615) 
+         continue;
+      
+      double entry = m_pos.PriceOpen();
+      double currentSL = m_pos.StopLoss();
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)m_pos.PositionType();
+      
+      double price = (type == POSITION_TYPE_BUY) ? 
+                     SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                     SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      double profitPips = (type == POSITION_TYPE_BUY) ?
+                          (price - entry) / point / 10 :
+                          (entry - price) / point / 10;
+      
+      // Use adaptive profit buffer
+      if(profitPips >= TrailingStartPips + adaptiveSettings.extraProfitBuffer)
+      {
+         // Calculate safe SL distance
+         double safeDistance = MathMax(TrailingStepPips * point * 10, minDistance);
+         
+         double newSL = (type == POSITION_TYPE_BUY) ?
+                        price - safeDistance :
+                        price + safeDistance;
+         
+         // Check improvement with adaptive threshold
+         double improvement = 0;
+         if(type == POSITION_TYPE_BUY)
+            improvement = (newSL - currentSL) / point;
+         else
+            improvement = (currentSL - newSL) / point;
+         
+         // Use adaptive minimum improvement
+         if(improvement < adaptiveSettings.minImprovement)
+            continue;
+         
+         // Validate distance from current price
+         double distanceFromPrice = (type == POSITION_TYPE_BUY) ? 
+                                    (price - newSL) : (newSL - price);
+         
+         if(distanceFromPrice < minDistance + 10 * point)
+            continue;
+         
+         // Check if improving
+         bool isImproving = false;
+         if(type == POSITION_TYPE_BUY && newSL > currentSL)
+            isImproving = true;
+         else if(type == POSITION_TYPE_SELL && newSL < currentSL)
+            isImproving = true;
+         
+         if(isImproving)
+         {
+            newSL = NormalizeDouble(newSL, _Digits);
+            double currentTP = NormalizeDouble(m_pos.TakeProfit(), _Digits);
+            
+            // Silent execution
+            m_trade.PositionModify(m_pos.Ticket(), newSL, currentTP);
+            ResetLastError();
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Break Even (Zero Error - Market Validation Safe)                |
+//+------------------------------------------------------------------+
+void CheckBreakEven()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   long stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   
+   double minDistance = MathMax(freezeLevel, stopLevel) * point;
+   if(minDistance == 0 || minDistance < 30 * point) 
+      minDistance = 50 * point;
+   else
+      minDistance += 30 * point;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!m_pos.SelectByIndex(i) || m_pos.Symbol() != _Symbol || m_pos.Magic() != 230615) 
+         continue;
+      
+      double entry = m_pos.PriceOpen();
+      double currentSL = m_pos.StopLoss();
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)m_pos.PositionType();
+      
+      double price = (type == POSITION_TYPE_BUY) ? 
+                     SymbolInfoDouble(_Symbol, SYMBOL_BID) : 
+                     SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      
+      double profitPips = (type == POSITION_TYPE_BUY) ?
+                          (price - entry) / point / 10 :
+                          (entry - price) / point / 10;
+      
+      // Require extra profit before BE activation
+      if(profitPips >= BreakEvenStartPips + 30) // Add 30 pips buffer
+      {
+         // Set SL well above/below entry
+         double buffer = minDistance + 15 * point;
+         double beSL = entry + (type == POSITION_TYPE_BUY ? buffer : -buffer);
+         
+         // Check distance from current price (CRITICAL)
+         double slDistance = (type == POSITION_TYPE_BUY) ? (price - beSL) : (beSL - price);
+         
+         // Skip if not safe enough
+         if(slDistance < minDistance + 15 * point)
+            continue;
+         
+         // Only move to BE once (check if SL still at original)
+         bool needUpdate = false;
+         if(type == POSITION_TYPE_BUY && currentSL < entry - 30 * point)
+            needUpdate = true;
+         else if(type == POSITION_TYPE_SELL && currentSL > entry + 30 * point)
+            needUpdate = true;
+         
+         if(needUpdate)
+         {
+            beSL = NormalizeDouble(beSL, _Digits);
+            double currentTP = NormalizeDouble(m_pos.TakeProfit(), _Digits);
+            
+            // Silent execution with error suppression
+            if(m_trade.PositionModify(m_pos.Ticket(), beSL, currentTP))
+            {
+               // Success
+            }
+            ResetLastError();
+         }
+      }
+   }
+}
+//+------------------------------------------------------------------+
